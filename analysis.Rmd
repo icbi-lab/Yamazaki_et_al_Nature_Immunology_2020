@@ -1,0 +1,334 @@
+---
+title: "Bioinformatics analysis for Yamazaki et al., Nature Immunology 2020"
+params:
+  METABRIC_expression_data: "./data/METABRIC_expression_data.txt"
+  METABRIC_clinical_data: "./data/METABRIC_clinical_data.txt"
+  MURCIA_clinical_data: "./data/MURCIA_clinical_data.txt"
+  msigdb: "./data/msigdb.v6.2.symbols.gmt"
+  Mito_proteins: "./data/subcell_location_Mitochondria.tsv"
+  resultsdir: "./results/"
+  GSEAdir: "./results/GSEA/"
+  libdir: "./lib/"
+  maxcores: 20
+---
+
+
+```{r setup, include=FALSE}
+
+library("xlsx")
+library("limma")
+library("GSVA")
+library("GSEABase")
+library("qusage")
+library("polycor")
+library("survival")
+library("survminer")
+library("ComplexHeatmap")
+library("circlize")
+library("foreign")
+
+source(file.path(params$lib, "analysis_functions.R"))
+
+```
+
+
+# METABRIC COHORT data processing -----
+
+```{r}
+### Prepare data
+
+# Load METABRIC clinical and expression data
+exprData <- read.table(file = file.path(params$METABRIC_expression_data))
+clinicalData <- read.table(file = file.path(params$METABRIC_clinical_data), sep = "\t", header = TRUE, check.names = FALSE)
+survData.csos <- getDiseaseSpecificSurvival(clinicalData)
+CovData <- getCovData(clinicalData)
+
+# Preselected GO and Hallmark genesets of interest
+genesetnames <- getGeneSets()
+genesets <- getMSigDB(database = file.path(params$msigdb), select = genesetnames)
+
+# ATG signature genes (ATG5-ATG12 conjugation module)
+ATGgenes <- c("ATG5", "ATG7", "ATG10", "ATG12","ATG16L1")
+ATGcolors <- c("Hi" = "#ffd000", "Lo" = "#007980")
+
+### Calculate scores
+
+# ATG scores
+ATGscores.raw <- getATGscore(exprData, ATGgenes)
+
+# IFN scores
+gsva.metabric <- calcGSVAscores(exprData, database = file.path(params$msigdb), maxcores = params$maxcores) #############
+IFNAscores <- gsva.metabric[names(ATGscores.raw),"IFNalpha"]
+IFNGscores <- gsva.metabric[names(ATGscores.raw),"IFNgamma"]
+
+# Mito scores
+MitoAll.raw <- getMitoScore(exprData, file = file.path(params$Mito_proteins), mitogenes = "MitoAll")
+MitoOnly.raw <- getMitoScore(exprData, file = file.path(params$Mito_proteins), mitogenes = "MitoOnly")
+
+# Scaled scores
+ATGscores <- as.numeric(scale(ATGscores.raw))
+names(ATGscores) <- names(ATGscores.raw)
+ATGHiLo <- getHiLo(ATGscores)
+MitoAll <- as.numeric(scale(MitoAll.raw[names(ATGscores)]))
+names(MitoAll) <- names(ATGscores)
+MitoOnly <- as.numeric(scale(MitoOnly.raw[names(ATGscores)]))
+names(MitoOnly) <- names(ATGscores)
+scoreData <- data.frame(ATG = ATGscores, IFNA = IFNAscores, IFNG = IFNGscores, MitoAll = MitoAll, MitoOnly = MitoOnly)
+
+# Get also the CSOS subsets
+ids.csos <- intersect(intersect(rownames(CovData), rownames(survData.csos)), names(ATGscores.raw))
+CovData.csos <- CovData[ids.csos,]
+survData.csos <- survData.csos[ids.csos,]
+exprData.csos <- exprData[,ids.csos]
+ATGscore.csos.raw <- ATGscores.raw[ids.csos]
+ATGHiLo.csos <- getHiLo(ATGscore.csos.raw)
+ATGscore.csos <- as.numeric(scale(ATGscore.csos.raw))
+names(ATGscore.csos) <- names(ATGscore.csos.raw)
+varsData.csos <- data.frame(ATG = ATGscore.csos, IFNA = gsva.metabric[ids.csos,"IFNalpha"], IFNG = gsva.metabric[ids.csos,"IFNgamma"])
+coxData.csos <- cbindIDs(CovData.csos, varsData.csos)
+
+### Differentially expressed genes between ATG-Hi and ATG-Lo tumors
+
+# All patients
+DEG <- runLimma(exprData, ATGHiLo)
+DEG <- DEG[ order(DEG$adj.P.Val),]
+upgenes <- rownames(DEG)[ DEG$DE == "up"][1:200]
+downgenes <- rownames(DEG)[ DEG$DE == "down"][1:200]
+
+# CSOS patients
+DEG.csos <- runLimma(exprData.csos, ATGHiLo.csos)
+DEG.csos <- DEG.csos[ order(DEG.csos$adj.P.Val),]
+upgenes.csos <- rownames(DEG.csos)[ DEG.csos$DE == "up"][1:200]
+downgenes.csos <- rownames(DEG.csos)[ DEG.csos$DE == "down"][1:200]
+
+### Correlations
+correlations <- data.frame(row.names = c("pval", "cor"))
+correlations$IFNA <- unlist(cor.test(scoreData$ATG, scoreData$IFNA, method = "spearman")[c("p.value", "estimate")])
+correlations$IFNG <- unlist(cor.test(scoreData$ATG, scoreData$IFNG, method = "spearman")[c("p.value", "estimate")])
+correlations$MitoAll <- unlist(cor.test(scoreData$ATG, scoreData$MitoAll, method = "spearman")[c("p.value", "estimate")])
+correlations$MitoOnly <- unlist(cor.test(scoreData$ATG, scoreData$MitoOnly, method = "spearman")[c("p.value", "estimate")])
+write.table(correlations, file = file.path(params$resultsdir, "Correlations.txt"), quote = FALSE)
+
+```
+
+
+# MURCIA COHORT data processing -----
+
+```{r}
+# Load Murcia cohort clinical data
+mudata <- read.table(file = file.path(params$MURCIA_clinical_data), sep = "\t", header = TRUE, check.names = FALSE)
+OS.mu <- as.numeric((pss2date(mudata$`Last visit Date`) -  pss2date(mudata$`Diagnostic date`))) / 30.4375
+DFS.mu <- as.numeric((pss2date(mudata$`Disease Free Survival Date`) -  pss2date(mudata$`Diagnostic date`))) / 30.4375
+survData.OS.mu <- data.frame(time = OS.mu, status = ifelse(mudata$Death == "Live", 0, 1), row.names = mudata$`Number patient`)
+survData.DFS.mu <- data.frame(time = DFS.mu, status = ifelse(mudata$`Relapse / Progression disease` == "Yes", 1, 0), row.names = mudata$`Number patient`)
+
+# mtRATIOs - patients with primary tumors
+mtRATIO.strata.prim <- getStrata(mudata$`mtRATIO primary tumor`)
+mtRATIO.strata.prim <- factor(ifelse(mtRATIO.strata.prim == "Hi","mtRATIO primary tumor - Hi", "mtRATIO primary tumor - Lo"))
+names(mtRATIO.strata.prim) <- mudata$`Number patient`
+
+# mtRATIOs - patients with metastases
+mtRATIO.strata.meta <- getStrata(mudata$`mtRATIO metastasis tumor`)
+mtRATIO.strata.meta <- factor(ifelse(mtRATIO.strata.meta == "Hi","mtRATIO metastasis - Hi", "mtRATIO metastasis - Lo"))
+names(mtRATIO.strata.meta) <- mudata$`Number patient`
+
+# Clinical covariates used for Cox regression
+coxData.mu <- data.frame(row.names = mudata$`Number patient`, mudata[,c("Age", "mtRATIO primary tumor", "Stage", "Histologic Tumor Subtype", "Histologic Tumor Grade (Recode)")])
+colnames(coxData.mu) <- c("Age", "prim.mtDNAratio", "Stage", "Histologic.Subtype", "Histologic.Grade")
+
+```
+
+
+
+# FIGURE 6 -----
+
+Fig. 6a: ATG signature inversely correlates with type I IFN and interferon gamma (IFNG)
+```{r}
+VPdf <- plotViolin(scoreData[,c("ATG", "IFNA", "IFNG")], file.path(params$resultsdir, "Figure 6a - Violinplots ATG-IFN.pdf"))
+
+```
+
+
+Fig. 6b (upper panel): Heatmap of top 200 upregulated and top 200 downregulated DE genes
+```{r}
+heatdata <- exprData[ c(upgenes, downgenes), ]
+heatdata <- (heatdata-apply(heatdata,1,mean))/apply(heatdata,1,sd)
+annDF <- data.frame("ATG" = ATGHiLo)
+annColors <- list("ATG" = ATGcolors)
+HeatMap(heatdata, "METABRIC all", annDF, annColors, file = file.path(params$resultsdir, "Figure 6b - Heatmap DEG All.pdf"))
+
+```
+
+
+Fig. 6b (lower panel): GSEA enrichment plots
+```{r}
+# Prepare data for GSEA
+GSEAinput <- prepareGSEAinput(exprData, ATGHiLo[colnames(exprData)], basename = "METABRIC_ATG", outputdir = params$GSEAdir)
+GSEAinput$GMT <- prepareGeneSets(genesets, basename = "METABRIC_ATG", outputdir = params$GSEAdir)
+
+# Run GSEA v3.0 tool using the GSEAinput files:
+print(unlist(GSEAinput))
+
+# Write results
+gsea.results.all <- getGSEAreport(file.path(params$GSEAdir, "METABRIC_ATG/"))
+write.xlsx(gsea.results.all, file = file.path(params$resultsdir, "GSEA results.xlsx"), sheetName = "METABRIC_All")
+
+```
+
+
+Fig. 6c: KM plot showing that patients with ATGHi tumors had a CSOS disadvantage
+```{r}
+KM <- KaplanMeier(survData.csos, ATGHiLo.csos, returnData = TRUE)
+KMplot <- plotKaplanMeier(KM, xlabel = "Time [months]", ylabel = "CSOS", colors = c("Hi" = "orangered","Lo" = "dodgerblue"))
+
+pdf(file = file.path(params$resultsdir, "Figure 6c - KM ATG CSOS.pdf"), onefile = TRUE)
+  plot(KMplot$plot)
+dev.off()
+
+```
+
+
+Fig. 6d: Violin plots showing that the ATG signature inversely correlated with the MitoAll signature
+```{r}
+VPdf <- cbind(VPdf, plotViolin(scoreData[,c("ATG", "MitoAll")], file.path(params$resultsdir, "Figure 6d - Violinplots ATG-MitoAll.pdf")))
+
+```
+
+
+
+# SUPPLEMENTARY TABLE 1 -----
+
+Write the top differentially expressed genes to table
+```{r}
+topDEgenes <- rbind(cbind("Enriched in" = "ATGHi", DEG[upgenes,c("logFC", "adj.P.Val")]), cbind("Enriched in" = "ATGLo", DEG[downgenes,c("logFC", "adj.P.Val")]))
+write.xlsx(topDEgenes[order(topDEgenes$logFC),], file = file.path(params$resultsdir, "Supplementary Table 1.xlsx"), sheetName = "All")
+
+topDEgenes.csos <- rbind(cbind("Enriched in" = "ATGHi", DEG.csos[upgenes.csos,c("logFC", "adj.P.Val")]), cbind("Enriched in" = "ATGLo", DEG.csos[downgenes.csos,c("logFC", "adj.P.Val")]))
+write.xlsx(topDEgenes.csos[order(topDEgenes.csos$logFC),], file = file.path(params$resultsdir, "Supplementary Table 1.xlsx"), sheetName = "CSOS", append = TRUE)
+
+```
+
+
+
+# SUPPLEMENTARY TABLE 2  -----
+
+Cox regression analysis of ATG-Hi vs. ATG-Lo patients
+```{r}
+# Cox regression analysis
+res.cox.uni <- getCoxres(UniCoxRegression(survData.csos, coxData.csos))
+report.uni <- data.frame(row.names = getCoxNames1()$Var, Variable = getCoxNames1()$Name, res.cox.uni[ getCoxNames1()$Var, c("H","pval","CI95_lower","CI95_upper")])
+colnames(report.uni) <- gsub("_", " ", colnames(report.uni), fixed = TRUE)
+
+sigvars.uni <- unique(res.cox.uni$Var[ res.cox.uni$pval <= 0.05])
+
+res.cox.multi <- getCox(MultiCoxRegression(survData.csos, coxData.csos, vars = sigvars.uni))
+report.multi <- data.frame(row.names = getCoxNames1()$Var, Variable = getCoxNames1()$Name, res.cox.multi[ getCoxNames1()$Var, c("H","pval","CI95_lower","CI95_upper")])
+colnames(report.multi) <- gsub("_", " ", colnames(report.multi), fixed = TRUE)
+
+# Covariate correlation analysis
+report.exclude <- CovCorr(sigvars.uni, survData.csos, coxData.csos)
+
+# Write results
+write.xlsx(report.uni, file = file.path(params$resultsdir, "Supplementary Table 2.xlsx"), sheetName = "Univariate", row.names = FALSE)
+write.xlsx(report.multi, file = file.path(params$resultsdir, "Supplementary Table 2.xlsx"), sheetName = "Multivariate", row.names = FALSE, append = TRUE)
+write.xlsx(report.exclude, file = file.path(params$resultsdir, "Supplementary Table 2.xlsx"), sheetName = "Multivariate (-1)", row.names = FALSE, append = TRUE)
+
+```
+
+
+
+# EXTENDED DATA FIGURE 5 -----
+
+Extended Data Fig. 5a: Heatmap of top 200 upregulated and top 200 downregulated DE genes (only CSOS patients)
+```{r}
+heatdata <- exprData.csos[ c(upgenes.csos, downgenes.csos), ]
+heatdata <- (heatdata-apply(heatdata,1,mean))/apply(heatdata,1,sd)
+annDF <- data.frame("ATG" = ATGHiLo.csos)
+annColors <- list("ATG" = ATGcolors)
+HeatMap(heatdata, "METABRIC CSOS", annDF, annColors, file = file.path(params$resultsdir, "Extended Data Figure 5a - Heatmap DEG CSOS.pdf"))
+
+```
+
+
+Extended Data Fig. 5b,c: GSEA enrichment plots showing that type I IFN, IFNG signaling and radiation responsiveness were underrepresented in ATGHi tumors
+```{r}
+# Prepare data for GSEA
+GSEAinput <- prepareGSEAinput(exprData.csos, ATGHiLo.csos[colnames(exprData.csos)], basename = "METABRIC_ATG_CSOS", outputdir = params$GSEAdir)
+GSEAinput$GMT <- prepareGeneSets(genesets, basename = "METABRIC_ATG_CSOS", outputdir = params$GSEAdir)
+
+# Run GSEA v3.0 tool using the GSEAinput files:
+print(unlist(GSEAinput))
+
+# Write results
+gsea.results.csos <- getGSEAreport(file.path(params$GSEAdir, "METABRIC_ATG_CSOS/"))
+write.xlsx(gsea.results.csos, file = file.path(params$resultsdir, "GSEA results.xlsx"), sheetName = "METABRIC_CSOS", append = TRUE)
+
+```
+
+
+Extended Data Fig. 5d: Violin plots showing that the ATG signature inversely correlated with the MitoOnly signature
+```{r}
+VPdf <- cbind(VPdf, plotViolin(scoreData[,c("ATG", "MitoOnly")], file.path(params$resultsdir, "Extended Data Figure 5d - Violinplots ATG-MitoOnly.pdf")))
+write.table(VPdf, file = file.path(params$resultsdir, "Violin_plots_pvalues.txt"), quote = FALSE)
+
+```
+
+
+Extended Data Fig. 5e: KM plots showing a trend for improved disease-free and overall survival in patients with mtDNA/gDNA-high tumors
+```{r}
+KM <- KaplanMeier(survData.OS.mu, classes = mtRATIO.strata.prim, returnData = TRUE)
+KMplot.OS <- plotKaplanMeier(KM, xlabel = "survival time [months]", ylabel = "OS", colors = c("mtRATIO primary tumor - Hi" = "orangered","mtRATIO primary tumor - Lo" = "dodgerblue"))
+
+KM <- KaplanMeier(survData.DFS.mu, classes = mtRATIO.strata.prim, returnData = TRUE)
+KMplot.DFS <- plotKaplanMeier(KM, xlabel = "survival time [months]", ylabel = "DFS", colors = c("mtRATIO primary tumor - Hi" = "orangered","mtRATIO primary tumor - Lo" = "dodgerblue"))
+
+pdf(file.path(params$resultsdir, "Extended Data Figure 5e - KM mtDNA ratios (primary tumors).pdf"), onefile = TRUE)
+  plot(KMplot.DFS$plot)
+  plot(KMplot.OS$plot)
+dev.off()
+
+```
+
+
+Extended Data Fig. 5f: KM plots showing a trend for improved disease-free in patients with mtDNA/gDNAHi metastases
+```{r}
+KM <- KaplanMeier(survData.DFS.mu, classes = mtRATIO.strata.meta, returnData = TRUE)
+KMplot.DFS.meta <- plotKaplanMeier(KM, xlabel = "survival time [months]", ylabel = "DFS", colors = c("mtRATIO metastasis - Hi" = "orangered","mtRATIO metastasis - Lo" = "dodgerblue"))
+
+pdf(file.path(params$resultsdir, "Extended Data Figure 5f - KM mtDNA ratios (metastasis).pdf"), onefile = TRUE)
+  plot(KMplot.DFS.meta$plot)
+dev.off()
+
+```
+
+
+
+# SUPPLEMENTARY TABLE 3  -----
+
+Cox regression analysis of mtDNA/gDNAHi ratios in primary tumors
+```{r}
+# DFS
+DFS.cox.uni <- getCoxres(UniCoxRegression(survData.DFS.mu, coxData.mu))
+reportDFS <- getReport(DFS.cox.uni)
+
+# OS
+OS.cox.uni <- getCoxres(UniCoxRegression(survData.OS.mu, coxData.mu))
+reportOS <- getReport(OS.cox.uni)
+
+# Write to table
+write.xlsx(reportDFS, file = file.path(params$resultsdir, "Supplementary Table 3.xlsx"), sheetName = "DFS uni", row.names = FALSE)
+write.xlsx(reportOS, file = file.path(params$resultsdir, "Supplementary Table 3.xlsx"), sheetName = "OS uni", row.names = FALSE, append = TRUE)
+
+```
+
+
+```{r}
+# Get package versions
+pkgs <- c("ggplot2", "limma", "ComplexHeatmap", "survminer", "survival")
+pkgs.versions <- sapply(pkgs, function(tmp) paste(packageVersion(tmp), collapse = ".") )
+write.table(pkgs.versions, file = file.path(params$resultsdir, "R package versions.txt"), quote = FALSE, col.names = FALSE)
+
+```
+
+
+
